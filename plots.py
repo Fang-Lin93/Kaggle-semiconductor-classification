@@ -1,5 +1,6 @@
 
 import matplotlib.pyplot as plt
+from sklearn import metrics
 
 
 def tensor2img(tensor, defect_area=None):
@@ -21,6 +22,25 @@ def tensor2img(tensor, defect_area=None):
 
     fig.show()
     return fig
+
+
+def plot_roc(pred_y, y):
+    """
+    AUC ROC
+    """
+    fpr, tpr, threshold = metrics.roc_curve(y, pred_y)
+    roc_auc = metrics.auc(fpr, tpr)
+
+    plt.title('Receiver Operating Characteristic')
+    plt.plot(fpr, tpr, 'b', label=f'AUC = {roc_auc:.6f}')
+    plt.legend(loc='lower right')
+    plt.plot([0, 1], [0, 1], 'r--')
+    plt.xlim([0, 1])
+    plt.ylim([0, 1])
+    plt.ylabel('True Positive Rate')
+    plt.xlabel('False Positive Rate')
+    plt.show()
+    return roc_auc
 
 
 

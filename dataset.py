@@ -32,7 +32,7 @@ class SemiCondData(Dataset):
     """
     use bootstrap to balance the good/defect data
     """
-    def __init__(self, frac=1.0, train=False):
+    def __init__(self, frac=1.0, train=False, boostrap=True):
         if train:
             self.len_good = int(len(GOOD) * frac)
             self.len_defect = int(len(DEFECT) * frac)
@@ -46,8 +46,12 @@ class SemiCondData(Dataset):
             self.defect = os.listdir(f'data/defect/')[-self.len_defect:]
         self.total_len = self.len_good + self.len_defect
 
+        self.boostrap = boostrap
+
     def __len__(self):
-        return len(self.good)*2
+        if self.boostrap:
+            return len(self.good)*2
+        return self.len_good + self.len_defect
 
     def __getitem__(self, index):
         """
@@ -63,10 +67,6 @@ class SemiCondData(Dataset):
             tensor = np.array(Image.open(f'data/defect/{random.choice(self.defect)}').resize(size=(275, 267)))[np.newaxis, :, :]
         return torch.FloatTensor(tensor) / 255, class_idx
 
-
-train_loader = DataLoader(SemiCondData(frac=0.8, train=True), batch_size=256, shuffle=True)
-validate_loader = DataLoader(SemiCondData(frac=0.8, train=False), batch_size=256, shuffle=True)
-test_loader = DataLoader(TestData(), batch_size=256, shuffle=True)
 
 defect_areas = pd.read_csv('data/defect_area.csv')
 

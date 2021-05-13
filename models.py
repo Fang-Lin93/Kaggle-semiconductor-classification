@@ -1,13 +1,13 @@
 import torch
 import time
-from torch import nn
-from abc import ABC
+import os
 import torch.nn.functional as F
+import pandas as pd
+from torch import nn
 from torch.utils.tensorboard import SummaryWriter
+from dataset import DataLoader, TestData
 from loguru import logger
-
-logger.remove()
-logger.add('logs/train.log', level='DEBUG')
+from sklearn import metrics
 
 
 class Transpose(nn.Module):
@@ -60,11 +60,13 @@ class MixerBlock(nn.Module):
 
 
 class MlpMixer(nn.Module):
-    def __init__(self, patch_size: int, channel_dim: int, num_blocks: int, width: int, height: int):
+    def __init__(self, patch_size: int, channel_dim: int, num_blocks: int, fig_size):
         super().__init__()
         self.patch_size = patch_size
+        width, height = fig_size
         self.token_dim = (width // patch_size) * (height // patch_size)
         self.channel_dim = channel_dim
+        self.num_blocks = num_blocks
         self.patch_proj = nn.Conv2d(1, channel_dim, kernel_size=(patch_size, patch_size),
                                     stride=(patch_size, patch_size))
 
@@ -80,11 +82,15 @@ class MlpMixer(nn.Module):
         x = self.out_fc(x.mean(axis=1))  # add global avg. pooling
         return x
 
-    def save_model(self, file='v0'):
-        torch.save(self.state_dict(), f'models_dict/{file}')
+    def save_model(self, file=''):
+        if not os.path.exists('models_dict'):
+            os.mkdir('models_dict')
+        torch.save(self.state_dict(),
+                   f'models_dict/{file}_p{self.patch_size}_c{self.channel_dim}_n{self.num_blocks}.mdl')
 
-    def load_model(self, file='v0'):
-        self.load_state_dict(torch.load(f'models_dict/{file}', map_location=torch.device('cpu')))
+    def load_model(self, file=''):
+        self.load_state_dict(torch.load(
+            f'models_dict/{file}_p{self.patch_size}_c{self.channel_dim}_n{self.num_blocks}.mdl', map_location=torch.device('cpu')))
 
     def __get_num_model_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -105,6 +111,7 @@ class ModelTrainer:
         self.l2_regular = kwargs.get('l2_regular', 1e-3)
         self.tolerance = kwargs.get('tolerance', 5)
         self.early_stop = kwargs.get('early_stop', True)
+        self.pred_every = kwargs.get('pred_every', 5)
         self.max_acc = -1
         self.min_loss = float('inf')
         self.non_improve = 0
@@ -113,13 +120,15 @@ class ModelTrainer:
 
     def loss_function(self, inputs, targets):
 
-        inputs, targets = inputs.to(self.device), targets.to(self.device)
         logits = self.model(inputs)
-        return F.cross_entropy(logits, targets), logits.argmax(dim=1)
+        return F.cross_entropy(logits, targets), logits.softmax(dim=1)[:, 1]
+        # return F.binary_cross_entropy(logits, targets.unsqueeze(1).float()), logits
+        # F_loss = FocalLoss(num_classes=2)
+        # return F_loss(logits, targets), logits.softmax(dim=1)[:, 1]
 
-    def train(self, train_loader, test_loader=None):
+    def train(self, tr_loader, val_loader=None):
 
-        num_batches = len(train_loader)
+        num_batches = len(tr_loader)
         lr = self.lr
         self.model.train()
         self.max_acc = -1
@@ -133,7 +142,7 @@ class ModelTrainer:
             if epoch % self.lr_sch_per == 0:
                 lr *= self.lr_decay
                 self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-            rec_num = self.train_loop(train_loader, test_loader, epoch, rec_num, num_batches)
+            rec_num = self.train_loop(tr_loader, val_loader, epoch, rec_num, num_batches)
 
             logger.info(f' Epoch {epoch}: {(time.time() - start_time):.3f}s, '
                         f'Remaining: {(time.time() - start_time) / (epoch + 1) * (self.N_epochs - (epoch + 1)):.3f}s')
@@ -149,59 +158,103 @@ class ModelTrainer:
         for batch_id, (x, y) in enumerate(tr_loader):
             self.optimizer.zero_grad()
             x, y = x.to(self.device), y.to(self.device)
-            loss, pred = self.loss_function(x, y)
-            acc = pred.eq(y).sum().true_divide(len(y))
+            loss, pred_prob = self.loss_function(x, y)
+
+            pred_class = (pred_prob > 0.5).float().view(-1)
+            acc = pred_class.eq(y).sum().true_divide(len(y))
+            auc = self.auc(pred_prob.view(-1).detach().cpu().numpy(), y.cpu())
+
             loss.backward()
             self.optimizer.step()
 
             self.writer.add_scalar(f'Train Loss {self.tag}', loss, rec_num)
             self.writer.add_scalar(f'Train Acc. {self.tag}', acc, rec_num)
+            self.writer.add_scalar(f'Train AUC. {self.tag}', auc, rec_num)
             rec_num += 1
             if batch_id % 10 == 0:
                 logger.info(f'Train ({self.tag}) [{batch_id}/{num_batches}]'
                             f'({100. * batch_id / num_batches:.0f}%)]'
-                            f'\tLoss: {loss.detach():.6f}\tAcc: {100 * acc.detach():.2f}%')
+                            f'\tLoss: {loss.detach():.6f}'
+                            f'\tAcc: {100 * acc.detach():.2f}%'
+                            f'\tAUC: {auc:.6f}')
         if val_loader:
             self.validate(val_loader, epoch)
             self.model.train()
+
+        if epoch > 0 and epoch % self.pred_every == 0:
+            self.prediction(epoch)
         return rec_num
 
     def validate(self, val_loader, epoch):
         correct = 0
         loss = 0.
         total = 0.
+        auc = 0.
         self.model.eval()
         with torch.no_grad():
             for batch_id, (x, y) in enumerate(val_loader):
                 x, y = x.to(self.device), y.to(self.device)
-                b_loss, pred = self.loss_function(x, y)
+                b_loss, pred_prob = self.loss_function(x, y)
+
+                pred_class = (pred_prob > 0.5).float().view(-1)
+                auc += self.auc(pred_prob.view(-1).cpu().numpy(), y.cpu())
+
                 loss += b_loss
-                correct += pred.eq(y).sum()
+                correct += pred_class.eq(y).sum()
                 total += y.size(0)
 
             avg_loss, acc = loss / len(val_loader), correct / total
+            avg_auc = auc/len(val_loader)
 
-            if avg_loss < self.min_loss:
-                self.min_loss = avg_loss
+            # if avg_loss < self.min_loss:
+            #     self.min_loss = avg_loss
+            #     self.non_improve = 0
+            # else:
+            #     self.non_improve += 1
+            if avg_auc > self.max_acc:
+                self.max_acc = avg_auc
                 self.non_improve = 0
             else:
                 self.non_improve += 1
 
             logger.info(f'Validate Loss: {avg_loss:.2f} '
-                        f'Validate Acc.: {100 * acc:.2f}%')
+                        f'Validate Acc.: {100 * acc:.2f}% '
+                        f'Validate AUC: {avg_auc:.6f}')
             self.writer.add_scalar(f'Validate Loss {self.tag}', avg_loss, epoch)
             self.writer.add_scalar(f'Validate Acc. {self.tag}', acc, epoch)
+            self.writer.add_scalar(f'Train AUC. {self.tag}', avg_auc, epoch)
 
+    @staticmethod
+    def auc(pred_y, y):
+        """
+        AUC
+        """
+        fpr, tpr, threshold = metrics.roc_curve(y, pred_y)
+        return metrics.auc(fpr, tpr)
 
-MixMLPModel = MlpMixer(patch_size=30, channel_dim=20, num_blocks=5, width=267, height=275)
+    def prediction(self, epoch):
+        """
+        Predicted csv
+        """
+        prediction = pd.read_csv('data/submission_sample.csv')
+        self.model.eval()
+        test_loader = DataLoader(TestData(), batch_size=512, shuffle=False)
+        b_size = test_loader.batch_size
+        with torch.no_grad():
+            for i, x in enumerate(test_loader):
+                x = x.to(self.device)
+                score = self.model(x).softmax(dim=1)
+                prediction.loc[i * b_size:(i + 1) * b_size - 1, 'defect_score'] = score[:, 1].cpu().numpy()
+        if not os.path.exists('results'):
+            os.mkdir('results')
+        prediction.to_csv(f'results/pred_{epoch}.csv', index=False)
 
 
 if __name__ == '__main__':
     from dataset import train_loader, validate_loader
 
-    model = MlpMixer(patch_size=30, channel_dim=20, num_blocks=5, width=267, height=275)
-    x = torch.rand(2, 1, 267, 275)
+    model_ = MlpMixer(patch_size=30, channel_dim=20, num_blocks=5, fig_size=(267, 275))
+    x_ = torch.rand(2, 1, 267, 275)
 
-    model_trainer = ModelTrainer(model)
-
-    model_trainer.train(train_loader, validate_loader)
+    model_tr = ModelTrainer(model_)
+    model_tr.train(train_loader, validate_loader)
