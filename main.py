@@ -13,9 +13,9 @@ logger.add('logs/train.log', level='DEBUG')
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 model_config = {
-    'patch_size': 32,
-    'channel_dim': 5,
-    'num_blocks': 2,
+    'patch_size': -1,
+    'channel_dim': 2,
+    'num_blocks': 1,
     'fig_size': (267, 275)
 }
 
@@ -26,7 +26,7 @@ trainer_config = {
     'lr_decay': 0.5,
     'device': device,
     'lr_sch_per': 10,
-    'l2_regular': 5e-4
+    'l2_regular': 5e-4,
 }
 
 """
@@ -42,7 +42,7 @@ train model
 """
 MixMLPModel = MlpMixer(**model_config)
 model_trainer = ModelTrainer(MixMLPModel, **trainer_config)
-model_trainer.train(train_loader, validate_loader)
+model_trainer.train(validate_loader, validate_loader)
 MixMLPModel.save_model()
 
 """
@@ -60,3 +60,8 @@ with torch.no_grad():
         prediction.loc[i * b_size:(i + 1) * b_size - 1, 'defect_score'] = score[:, 1].numpy()
 
 prediction.to_csv('prediction.csv', index=False)
+
+
+
+
+
